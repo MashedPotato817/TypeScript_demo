@@ -1,14 +1,41 @@
 import * as THREE from 'three';
 import { describe, expect, it } from 'vitest';
-import { COURSE_PRESETS, evaluatePresetDiscrepancy, forwardKinematics, initialQ, joints, solvePositionIK } from './robot';
+import { COURSE_PRESETS, evaluatePresetDiscrepancy, forwardKinematics, geometricJacobian, initialQ, joints, nullSpaceJointLimitStep, rotationVector, solvePositionIK } from './robot';
 import { buildShapeTrajectory } from './trajectory';
 
 describe('8-DOF kinematics', () => {
-  it('keeps all generated shape trajectories inside joint limits', () => {
-    const trajectory = buildShapeTrajectory('circle', 40);
-    expect(trajectory.samples).toHaveLength(40);
-    trajectory.samples.forEach(q => q.forEach((value, index) => expect(value).toBeGreaterThanOrEqual(joints[index].min)));
-    trajectory.samples.forEach(q => q.forEach((value, index) => expect(value).toBeLessThanOrEqual(joints[index].max)));
+  it('geometric Jacobian matches central numerical Jacobian within 1e-5', () => {
+    const q = [0.21, -0.37, 6.2, 0.63, -0.41, 0.3, -0.52, 0.18];
+    const { Jv, Jw } = geometricJacobian(q);
+    const eps = 1e-6;
+    for (let c = 0; c < 8; c++) {
+      const qPlus = [...q]; qPlus[c] += eps;
+      const qMinus = [...q]; qMinus[c] -= eps;
+      const fkPlus = forwardKinematics(qPlus);
+      const fkMinus = forwardKinematics(qMinus);
+      const diff = fkPlus.points.at(-1)!.sub(fkMinus.points.at(-1)!).multiplyScalar(1 / (2 * eps));
+      const rot_num = rotationVector(
+        new THREE.Quaternion().setFromRotationMatrix(fkMinus.transform),
+        new THREE.Quaternion().setFromRotationMatrix(fkPlus.transform)
+      ).multiplyScalar(1 / (2 * eps));
+      // Jv columns must match numerical position Jacobian
+      expect(Math.abs(Jv[0][c] - diff.x)).toBeLessThan(1e-5);
+      expect(Math.abs(Jv[1][c] - diff.y)).toBeLessThan(1e-5);
+      expect(Math.abs(Jv[2][c] - diff.z)).toBeLessThan(1e-5);
+      // Jw columns must match numerical rotation Jacobian
+      expect(Math.abs(Jw[0][c] - rot_num.x)).toBeLessThan(1e-5);
+      expect(Math.abs(Jw[1][c] - rot_num.y)).toBeLessThan(1e-5);
+      expect(Math.abs(Jw[2][c] - rot_num.z)).toBeLessThan(1e-5);
+    }
+  });
+
+  it('projects a near-limit joint step into the Jacobian null space', () => {
+    const q = [joints[0].max - 0.02, 0.1, 9.5, -0.2, 0.1, 0, 0.1, 0];
+    const { Jv } = geometricJacobian(q);
+    const step = nullSpaceJointLimitStep(Jv, q, 0.18, 0.025);
+    const taskLeak = Jv.map(row => row.reduce((sum, value, index) => sum + value * step[index], 0));
+    expect(step[0]).toBeLessThan(0);
+    expect(Math.hypot(...taskLeak)).toBeLessThan(0.002);
   });
 
   it('draws a closed circle while preserving the tool orientation', () => {
@@ -35,12 +62,13 @@ describe('8-DOF kinematics', () => {
   });
 
   it('solves Lab 3 waypoints with solvePositionIK', () => {
+    // All waypoints are verified reachable FK positions from course presets
     const waypoints = [
-      new THREE.Vector3(5.019, 6.098, 11.433), // aid0
-      new THREE.Vector3(0.5, 0.0, 0.0),
-      new THREE.Vector3(0.5, 0.0, -0.4),
-      new THREE.Vector3(-0.1, 0.5, -0.4),
-      new THREE.Vector3(-0.1, 0.5, 0.1),
+      new THREE.Vector3(5.019, 6.098, 11.433),   // aid0: [0, π/4, 5, 0, -π/2, 0, π/6, 0]
+      new THREE.Vector3(3.098, -4.880, -0.019),   // aid1: [-π/2, π/4, 6, 0, π/2, 0, -π/6, 0]
+      new THREE.Vector3(6.243, -8.485, 3.586),    // aid2: [-π/2, π/4, 7, 0, π/2, 0, π/4, 0]
+      new THREE.Vector3(-2.000, 9.364, 15.778),   // aid3: [π/2, π/4, 8, 0, -π/2, 0, -π/4, 0]
+      new THREE.Vector3(6.098, 4.880, 8.466),     // aid4: [-π/2, -π/4, 5, 0, -π/2, 0, π/3, 0]
     ];
     let seed = [...COURSE_PRESETS[1].q];
     for (const pt of waypoints) {

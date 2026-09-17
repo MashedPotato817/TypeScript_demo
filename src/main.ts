@@ -3,6 +3,7 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import {
   COURSE_PRESETS,
   type CoursePreset,
+  computeManipulability,
   evaluatePresetDiscrepancy,
   forwardKinematics,
   formatJoint,
@@ -125,6 +126,11 @@ app.innerHTML = `
           <div><small>X</small><strong id="coordX">—</strong></div>
           <div><small>Y</small><strong id="coordY">—</strong></div>
           <div><small>Z</small><strong id="coordZ">—</strong></div>
+        </div>
+        <div class="manipulability-row">
+          <small>可操作度 <em>w</em></small>
+          <span id="manipulabilityBar" class="manip-bar"><span id="manipulabilityFill" class="manip-fill"></span></span>
+          <strong id="manipulabilityVal">—</strong><span id="manipulabilityState" class="manip-state">计算中</span>
         </div>
         <div class="matrix-header">齐次变换矩阵 <span>T<sub>0,8</sub></span></div>
         <pre id="matrix"></pre>
@@ -277,6 +283,18 @@ function refresh(): void {
   document.querySelector('#coordX')!.textContent = endpoint.x.toFixed(2);
   document.querySelector('#coordY')!.textContent = endpoint.y.toFixed(2);
   document.querySelector('#coordZ')!.textContent = endpoint.z.toFixed(2);
+
+  const manipulability = computeManipulability(q);
+  const normalizedManipulability = THREE.MathUtils.clamp(manipulability / 50, 0, 1);
+  const manipBar = document.querySelector<HTMLElement>('#manipulabilityBar')!;
+  const manipFill = document.querySelector<HTMLElement>('#manipulabilityFill')!;
+  const manipValue = document.querySelector('#manipulabilityVal')!;
+  const manipState = document.querySelector('#manipulabilityState')!;
+  const state = manipulability < 2 ? '接近奇异' : manipulability < 10 ? '一般' : '灵巧';
+  manipBar.dataset.state = state;
+  manipFill.style.width = `${normalizedManipulability * 100}%`;
+  manipValue.textContent = manipulability.toFixed(2);
+  manipState.textContent = `${state} · 零空间避限位已启用`;
 
   const elements = result.transform.elements;
   document.querySelector('#matrix')!.textContent = [0, 1, 2, 3]

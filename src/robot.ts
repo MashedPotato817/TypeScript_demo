@@ -183,44 +183,153 @@ export interface PoseIkResult extends IkResult {
   orientationError: number;
 }
 
-/** Damped least-squares position IK; the current configuration is the seed. */
+export interface GeometricJacobianResult {
+  Jv: number[][]; // 3x8 linear velocity Jacobian
+  Jw: number[][]; // 3x8 angular velocity Jacobian
+  J: number[][];  // 6x8 full geometric Jacobian
+  fk: KinematicsResult;
+}
+
+/**
+ * 解析几何雅可比矩阵（Craig《机器人学导论》第5章原理）
+ * 依据一次正运动学中各关节连杆变换矩阵，直接解析推导 Jv 与 Jw，完全消灭数值有限微商的截断误差。
+ */
+export function geometricJacobian(q: number[]): GeometricJacobianResult {
+  const fk = forwardKinematics(q);
+  const pe = fk.points.at(-1)!;
+  const Jv: number[][] = Array.from({ length: 3 }, () => Array(8).fill(0));
+  const Jw: number[][] = Array.from({ length: 3 }, () => Array(8).fill(0));
+  const J: number[][] = Array.from({ length: 6 }, () => Array(8).fill(0));
+
+  for (let i = 0; i < 8; i += 1) {
+    const te = fk.transforms[i].elements;
+    // z axis of joint frame i in base coordinates (column 2 of transform matrix)
+    const zx = te[8], zy = te[9], zz = te[10];
+    const pi = fk.points[i];
+
+    if (joints[i].kind === 'revolute') {
+      const rx = pe.x - pi.x;
+      const ry = pe.y - pi.y;
+      const rz = pe.z - pi.z;
+      // Jv = z x r
+      const vx = zy * rz - zz * ry;
+      const vy = zz * rx - zx * rz;
+      const vz = zx * ry - zy * rx;
+      Jv[0][i] = vx; Jv[1][i] = vy; Jv[2][i] = vz;
+      Jw[0][i] = zx; Jw[1][i] = zy; Jw[2][i] = zz;
+      J[0][i] = vx; J[1][i] = vy; J[2][i] = vz;
+      J[3][i] = zx; J[4][i] = zy; J[5][i] = zz;
+    } else {
+      // prismatic (joint 3): Jv = z, Jw = 0
+      Jv[0][i] = zx; Jv[1][i] = zy; Jv[2][i] = zz;
+      Jw[0][i] = 0; Jw[1][i] = 0; Jw[2][i] = 0;
+      J[0][i] = zx; J[1][i] = zy; J[2][i] = zz;
+      J[3][i] = 0; J[4][i] = 0; J[5][i] = 0;
+    }
+  }
+  return { Jv, Jw, J, fk };
+}
+
+/** Yoshikawa 可操作度测度: w = sqrt(det(Jv * Jv^T))，表征机械臂在当前构型下的运动灵巧度 */
+export function computeManipulability(q: number[]): number {
+  const { Jv } = geometricJacobian(q);
+  const m00 = Jv[0].reduce((s, v) => s + v * v, 0);
+  const m01 = Jv[0].reduce((s, v, k) => s + v * Jv[1][k], 0);
+  const m02 = Jv[0].reduce((s, v, k) => s + v * Jv[2][k], 0);
+  const m11 = Jv[1].reduce((s, v) => s + v * v, 0);
+  const m12 = Jv[1].reduce((s, v, k) => s + v * Jv[2][k], 0);
+  const m22 = Jv[2].reduce((s, v) => s + v * v, 0);
+
+  const det =
+    m00 * (m11 * m22 - m12 * m12) -
+    m01 * (m01 * m22 - m12 * m02) +
+    m02 * (m01 * m12 - m11 * m02);
+
+  return Math.sqrt(Math.max(0, det));
+}
+
+/** 关节行程限位势能梯度: 驱动关节远离限位死角，趋向行程中间舒适区 */
+export function jointLimitGradient(q: number[]): number[] {
+  return q.map((val, idx) => {
+    const min = joints[idx].min;
+    const max = joints[idx].max;
+    const mid = (min + max) * 0.5;
+    const span = max - min;
+    return -2 * (val - mid) / (span * span);
+  });
+}
+
+function multiplyMatrixVector(matrix: number[][], vector: number[]): number[] {
+  return matrix.map(row => row.reduce((sum, value, index) => sum + value * vector[index], 0));
+}
+
+/** DLS 伪逆 J† = Jᵀ(JJᵀ + λ²I)⁻¹；适用于 3×8 或 6×8 雅可比矩阵。 */
+function dampedPseudoInverse(jacobian: number[][], damping: number): number[][] | null {
+  const rows = jacobian.length;
+  const columns = jacobian[0].length;
+  const jjT = Array.from({ length: rows }, (_, row) =>
+    Array.from({ length: rows }, (_, col) =>
+      jacobian[row].reduce((sum, value, index) => sum + value * jacobian[col][index], row === col ? damping ** 2 : 0)
+    )
+  );
+  const inverseColumns = Array.from({ length: rows }, (_, column) => {
+    const unit = Array.from({ length: rows }, (_, index) => index === column ? 1 : 0);
+    return solveLinearSystem(jjT, unit);
+  });
+  if (inverseColumns.some(column => column === null)) return null;
+  const inverse = Array.from({ length: rows }, (_, row) => inverseColumns.map(column => column![row]));
+  return Array.from({ length: columns }, (_, column) =>
+    Array.from({ length: rows }, (_, row) => jacobian.reduce((sum, values, index) => sum + values[column] * inverse[index][row], 0))
+  );
+}
+
+/**
+ * 零空间限位回避步：P∇H = (I - J†J)∇H。
+ * 该步在一阶近似下不改变末端主任务，仅将冗余自由度推向行程中点。
+ */
+export function nullSpaceJointLimitStep(
+  jacobian: number[][],
+  q: number[],
+  damping: number,
+  weight: number
+): number[] {
+  const pseudoInverse = dampedPseudoInverse(jacobian, damping);
+  if (!pseudoInverse) return Array(q.length).fill(0);
+  const gradient = jointLimitGradient(q);
+  const projected = gradient.map((value, index) =>
+    value - multiplyMatrixVector(pseudoInverse, multiplyMatrixVector(jacobian, gradient))[index]
+  );
+  return projected.map(value => value * weight);
+}
+
+/** Damped least-squares position IK with geometric Jacobian and null-space joint limit avoidance */
 export function solvePositionIK(target: THREE.Vector3, seed: number[], maxIterations = 180): IkResult {
   let q = clampConfiguration(seed);
-  const epsilon = 1e-4;
   const damping = 0.18;
+  const nullspaceWeight = 0.025;
   let error = Infinity;
 
   for (let iteration = 0; iteration < maxIterations; iteration += 1) {
-    const end = forwardKinematics(q).points.at(-1)!;
+    const { Jv, fk } = geometricJacobian(q);
+    const end = fk.points.at(-1)!;
     const delta = target.clone().sub(end);
     error = delta.length();
     if (error < 0.015) return { q, error, iterations: iteration + 1, converged: true };
 
-    const jacobian = Array.from({ length: 3 }, () => Array(8).fill(0));
-    for (let column = 0; column < 8; column += 1) {
-      const sample = [...q];
-      sample[column] = Math.min(sample[column] + epsilon, joints[column].max);
-      const derivative = forwardKinematics(sample).points.at(-1)!.sub(end).multiplyScalar(1 / epsilon);
-      jacobian[0][column] = derivative.x;
-      jacobian[1][column] = derivative.y;
-      jacobian[2][column] = derivative.z;
-    }
-    const jjT = new THREE.Matrix3();
-    const e = jjT.elements;
-    for (let row = 0; row < 3; row += 1) {
-      for (let col = 0; col < 3; col += 1) {
-        e[col * 3 + row] = jacobian[row].reduce((sum, value, k) => sum + value * jacobian[col][k], 0) + (row === col ? damping ** 2 : 0);
-      }
-    }
-    const scaledError = delta.applyMatrix3(jjT.invert());
-    const step = Array.from({ length: 8 }, (_, col) => jacobian[0][col] * scaledError.x + jacobian[1][col] * scaledError.y + jacobian[2][col] * scaledError.z);
-    q = clampConfiguration(q.map((value, index) => value + THREE.MathUtils.clamp(step[index], -0.16, 0.16)));
+    const pseudoInverse = dampedPseudoInverse(Jv, damping);
+    if (!pseudoInverse) break;
+    const primaryStep = multiplyMatrixVector(pseudoInverse, [delta.x, delta.y, delta.z]);
+    const secondaryStep = nullSpaceJointLimitStep(Jv, q, damping, nullspaceWeight);
+
+    q = clampConfiguration(q.map((value, index) =>
+      value + THREE.MathUtils.clamp(primaryStep[index] + secondaryStep[index], -0.16, 0.16)
+    ));
   }
   error = forwardKinematics(q).points.at(-1)!.distanceTo(target);
   return { q, error, iterations: maxIterations, converged: error < 0.04 };
 }
 
-function rotationVector(from: THREE.Quaternion, to: THREE.Quaternion): THREE.Vector3 {
+export function rotationVector(from: THREE.Quaternion, to: THREE.Quaternion): THREE.Vector3 {
   const delta = to.clone().multiply(from.clone().invert()).normalize();
   if (delta.w < 0) delta.set(-delta.x, -delta.y, -delta.z, -delta.w);
   const sine = Math.sqrt(delta.x ** 2 + delta.y ** 2 + delta.z ** 2);
@@ -246,49 +355,66 @@ function solveLinearSystem(matrix: number[][], vector: number[]): number[] | nul
   return augmented.map(row => row.at(-1)!);
 }
 
-/** Six-dimensional damped least-squares IK: position and tool orientation are locked together. */
-export function solvePoseIK(target: THREE.Vector3, targetOrientation: THREE.Quaternion, seed: number[], maxIterations = 110): PoseIkResult {
+/** Six-dimensional geometric DLS IK with tool orientation locked and null-space avoidance */
+export function solvePoseIK(
+  target: THREE.Vector3,
+  targetOrientation: THREE.Quaternion,
+  seed: number[],
+  maxIterations = 110
+): PoseIkResult {
   let q = clampConfiguration(seed);
-  const epsilon = 1e-4;
   const orientationWeight = 2.2;
   const damping = 0.22;
+  const nullspaceWeight = 0.025;
   let positionError = Infinity;
   let orientationError = Infinity;
 
   for (let iteration = 0; iteration < maxIterations; iteration += 1) {
-    const current = forwardKinematics(q);
-    const position = current.points.at(-1)!;
-    const orientation = new THREE.Quaternion().setFromRotationMatrix(current.transform);
+    const { J, fk } = geometricJacobian(q);
+    const position = fk.points.at(-1)!;
+    const orientation = new THREE.Quaternion().setFromRotationMatrix(fk.transform);
     const positionDelta = target.clone().sub(position);
     const rotationDelta = rotationVector(orientation, targetOrientation);
     positionError = positionDelta.length();
     orientationError = rotationDelta.length();
-    if (positionError < 0.012 && orientationError < 0.018) return { q, error: positionError, orientationError, iterations: iteration + 1, converged: true };
-
-    const jacobian = Array.from({ length: 6 }, () => Array(8).fill(0));
-    for (let column = 0; column < 8; column += 1) {
-      const sample = [...q];
-      const direction = q[column] + epsilon <= joints[column].max ? 1 : -1;
-      sample[column] = THREE.MathUtils.clamp(q[column] + direction * epsilon, joints[column].min, joints[column].max);
-      const change = sample[column] - q[column];
-      if (Math.abs(change) < 1e-10) continue;
-      const perturbed = forwardKinematics(sample);
-      const translated = perturbed.points.at(-1)!.sub(position).multiplyScalar(1 / change);
-      const rotated = rotationVector(orientation, new THREE.Quaternion().setFromRotationMatrix(perturbed.transform)).multiplyScalar(1 / change);
-      jacobian[0][column] = translated.x; jacobian[1][column] = translated.y; jacobian[2][column] = translated.z;
-      jacobian[3][column] = rotated.x * orientationWeight; jacobian[4][column] = rotated.y * orientationWeight; jacobian[5][column] = rotated.z * orientationWeight;
+    if (positionError < 0.012 && orientationError < 0.018) {
+      return { q, error: positionError, orientationError, iterations: iteration + 1, converged: true };
     }
-    const residual = [positionDelta.x, positionDelta.y, positionDelta.z, rotationDelta.x * orientationWeight, rotationDelta.y * orientationWeight, rotationDelta.z * orientationWeight];
-    const normal = Array.from({ length: 8 }, (_, row) => Array.from({ length: 8 }, (_, col) => jacobian.reduce((sum, values) => sum + values[row] * values[col], row === col ? damping ** 2 : 0)));
-    const right = Array.from({ length: 8 }, (_, column) => jacobian.reduce((sum, values, row) => sum + values[column] * residual[row], 0));
-    const step = solveLinearSystem(normal, right);
-    if (!step) break;
-    q = clampConfiguration(q.map((value, index) => value + THREE.MathUtils.clamp(step[index], -0.12, 0.12)));
+
+    const weightedJ = J.map((row, rIdx) =>
+      rIdx >= 3 ? row.map(v => v * orientationWeight) : [...row]
+    );
+    const residual = [
+      positionDelta.x,
+      positionDelta.y,
+      positionDelta.z,
+      rotationDelta.x * orientationWeight,
+      rotationDelta.y * orientationWeight,
+      rotationDelta.z * orientationWeight,
+    ];
+
+    const pseudoInverse = dampedPseudoInverse(weightedJ, damping);
+    if (!pseudoInverse) break;
+    const primaryStep = multiplyMatrixVector(pseudoInverse, residual);
+    const secondaryStep = nullSpaceJointLimitStep(weightedJ, q, damping, nullspaceWeight);
+
+    q = clampConfiguration(q.map((value, index) =>
+      value + THREE.MathUtils.clamp(primaryStep[index] + secondaryStep[index], -0.12, 0.12)
+    ));
   }
   const result = forwardKinematics(q);
   positionError = result.points.at(-1)!.distanceTo(target);
-  orientationError = rotationVector(new THREE.Quaternion().setFromRotationMatrix(result.transform), targetOrientation).length();
-  return { q, error: positionError, orientationError, iterations: maxIterations, converged: positionError < 0.05 && orientationError < 0.07 };
+  orientationError = rotationVector(
+    new THREE.Quaternion().setFromRotationMatrix(result.transform),
+    targetOrientation
+  ).length();
+  return {
+    q,
+    error: positionError,
+    orientationError,
+    iterations: maxIterations,
+    converged: positionError < 0.05 && orientationError < 0.07,
+  };
 }
 
 export function formatJoint(value: number, index: number): string {

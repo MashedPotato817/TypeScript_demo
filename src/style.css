@@ -36,3 +36,7 @@ main { display:grid; grid-template-columns:minmax(580px,1fr) 390px; height:calc(
 .comparison-grid div { font: 10px 'DM Mono'; }
 .comparison-grid small { display: block; color: #778f7c; margin-bottom: 2px; }
 .comparison-grid strong { color: #8ee28c; font-size: 11px; }
+.manipulability-row { display:grid; grid-template-columns:80px 1fr auto; align-items:center; gap:8px; margin:-5px 0 15px; font:10px 'DM Mono'; color:#91a891; }
+.manipulability-row small { color:#a8bb9e; }.manipulability-row em { color:#dcebb6; font-style:normal; }.manipulability-row strong { color:#dcebb6; min-width:34px; text-align:right; }
+.manip-bar { height:6px; overflow:hidden; border-radius:4px; background:#314036; }.manip-fill { display:block; width:0; height:100%; background:#88cf85; transition:width .18s ease, background .18s ease; }
+.manip-bar[data-state='一般'] .manip-fill { background:#e1c76f; }.manip-bar[data-state='接近奇异'] .manip-fill { background:#e37967; }.manip-state { grid-column:2 / 4; color:#738875; font-size:9px; }
