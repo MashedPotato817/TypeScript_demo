@@ -34,6 +34,121 @@ export const joints: JointDefinition[] = [
 
 export const initialQ = [0, Math.PI / 6, 5, -Math.PI / 4, Math.PI / 6, 0, Math.PI / 6, 0];
 
+export interface CoursePreset {
+  id: string;
+  name: string;
+  tag: string;
+  description: string;
+  q: number[];
+  theoreticalPos: [number, number, number];
+  theoreticalMatrix: number[][];
+}
+
+export const COURSE_PRESETS: CoursePreset[] = [
+  {
+    id: 'init',
+    name: '初始位姿 (init)',
+    tag: '基础位形',
+    description: '实验一、二、三的基准构型，第3关节滑动位移 5.0，其余转角为 [0°, 30°, 5, -45°, 30°, 0°, 30°, 0°]',
+    q: [0, Math.PI / 6, 5, -Math.PI / 4, Math.PI / 6, 0, Math.PI / 6, 0],
+    theoreticalPos: [10.672, -0.535, 6.823],
+    theoreticalMatrix: [
+      [0.549, 0.390, 0.739, 10.672],
+      [-0.177, 0.919, -0.354, -0.535],
+      [-0.817, 0.063, 0.573, 6.823],
+      [0, 0, 0, 1]
+    ]
+  },
+  {
+    id: 'aid0',
+    name: '实验二 目标 1 (aid0)',
+    tag: '目标 1',
+    description: '关节变量 [0°, 45°, 5, 0°, -90°, 0°, 30°, 0°]，用于验证齐次变换矩阵 T0',
+    q: [0, Math.PI / 4, 5, 0, -Math.PI / 2, 0, Math.PI / 6, 0],
+    theoreticalPos: [5.019, 6.098, 11.433],
+    theoreticalMatrix: [
+      [0.6124, -0.3536, -0.7071, 5.019],
+      [0.5, 0.866, 0.0, 6.098],
+      [0.6124, -0.3536, 0.7071, 11.433],
+      [0, 0, 0, 1]
+    ]
+  },
+  {
+    id: 'aid1',
+    name: '实验二 目标 2 (aid1)',
+    tag: '目标 2',
+    description: '关节变量 [-90°, 45°, 6, 0°, 90°, 0°, -30°, 0°]，移动关节伸长至 6.0',
+    q: [-Math.PI / 2, Math.PI / 4, 6, 0, Math.PI / 2, 0, -Math.PI / 6, 0],
+    theoreticalPos: [3.098, -4.880, -0.019],
+    theoreticalMatrix: [
+      [-0.5, 0.866, 0.0, 3.098],
+      [0.6124, 0.3536, -0.7071, -4.880],
+      [-0.6124, -0.3536, -0.7071, -0.019],
+      [0, 0, 0, 1]
+    ]
+  },
+  {
+    id: 'aid2',
+    name: '实验二 目标 3 (aid2)',
+    tag: '目标 3',
+    description: '关节变量 [-90°, 45°, 7, 0°, 90°, 0°, 45°, 0°]，移动关节伸长至 7.0',
+    q: [-Math.PI / 2, Math.PI / 4, 7, 0, Math.PI / 2, 0, Math.PI / 4, 0],
+    theoreticalPos: [6.243, -8.485, 3.586],
+    theoreticalMatrix: [
+      [0.7071, 0.7071, 0.0, 6.243],
+      [0.5, -0.5, -0.7071, -8.485],
+      [-0.5, 0.5, -0.7071, 3.586],
+      [0, 0, 0, 1]
+    ]
+  },
+  {
+    id: 'aid3',
+    name: '实验二 目标 4 (aid3)',
+    tag: '目标 4',
+    description: '关节变量 [90°, 45°, 8, 0°, -90°, 0°, -45°, 0°]，移动关节伸长至 8.0',
+    q: [Math.PI / 2, Math.PI / 4, 8, 0, -Math.PI / 2, 0, -Math.PI / 4, 0],
+    theoreticalPos: [-2.000, 9.364, 15.778],
+    theoreticalMatrix: [
+      [0.7071, -0.7071, 0.0, -2.000],
+      [0.5, 0.5, -0.7071, 9.364],
+      [0.5, 0.5, 0.7071, 15.778],
+      [0, 0, 0, 1]
+    ]
+  },
+  {
+    id: 'aid4',
+    name: '实验二 目标 5 (aid4)',
+    tag: '目标 5',
+    description: '关节变量 [-90°, -45°, 5, 0°, -90°, 0°, 60°, 0°]，移动副 5.0，关节5为负角度',
+    q: [-Math.PI / 2, -Math.PI / 4, 5, 0, -Math.PI / 2, 0, Math.PI / 3, 0],
+    theoreticalPos: [6.098, 4.880, 8.466],
+    theoreticalMatrix: [
+      [0.866, 0.5, 0.0, 6.098],
+      [0.3536, -0.6124, 0.7071, 4.880],
+      [0.3536, -0.6124, -0.7071, 8.466],
+      [0, 0, 0, 1]
+    ]
+  }
+];
+
+export function evaluatePresetDiscrepancy(q: number[], theoreticalMatrix: number[][]) {
+  const result = forwardKinematics(q);
+  const elements = result.transform.elements;
+  let maxDiff = 0;
+  for (let row = 0; row < 4; row += 1) {
+    for (let col = 0; col < 4; col += 1) {
+      const actual = elements[col * 4 + row];
+      const theo = theoreticalMatrix[row][col];
+      const diff = Math.abs(actual - theo);
+      if (diff > maxDiff) maxDiff = diff;
+    }
+  }
+  const endPoint = result.points.at(-1)!;
+  const theoPos = new THREE.Vector3(theoreticalMatrix[0][3], theoreticalMatrix[1][3], theoreticalMatrix[2][3]);
+  const posError = endPoint.distanceTo(theoPos);
+  return { maxDiff, posError, actualPos: endPoint };
+}
+
 export function clampConfiguration(q: number[]): number[] {
   return q.map((value, index) => THREE.MathUtils.clamp(value, joints[index].min, joints[index].max));
 }
